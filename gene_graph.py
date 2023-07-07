@@ -16,30 +16,48 @@
 #   Show relationships with protein domains and their cellular process or function
 #   Show miRNA interactions with protein coding genes (https://mirtarbase.cuhk.edu.cn/~miRTarBase/miRTarBase_2022/php/index.php)
 #   Expand the usefulness of the database
-#   Utilize interactions:
-            # <Gene-commentary>
-            #     <Gene-commentary_type value="generif">18</Gene-commentary_type>
-            #     <Gene-commentary_heading>Interactions</Gene-commentary_heading> 
-            #     <Gene-commentary_comment>
+#   Get information on medications that are known to have some influence on gene expression
+#   Get information on externally caused interactions where research shows gene expression is influenced
+#   
 # Author: Daniel Kulas
 #
 ##################################################################
 
 import argparse
-import concurrent.futures
 import csv
 import json
 import networkx as nx
 import os
-import pickle
 import sqlalchemy as sa
 import zlib
 
 from Bio import Entrez
+from collections import defaultdict
+from collections import deque
+from copy import deepcopy
+from sqlalchemy.orm import sessionmaker
 from time import sleep
+from tqdm import tqdm
 from typing import List
 
+# TODO: I could probably remove this
 from EntrezGeneratedClasses import EntrezGeneElement
+
+Base = sa.orm.declarative_base()
+
+class GeneDatabase:
+    def __init__(self, engine: sa.Engine, session: sessionmaker):
+        self.engine = engine
+        self.session = session
+
+
+def open_database() -> GeneDatabase:
+    engine = sa.create_engine('sqlite:///genes.db', echo=False)
+    Base.metadata.create_all(engine)
+    SessionMaker = sessionmaker(bind=engine)
+    session = SessionMaker()
+    return GeneDatabase(engine, session)
+
 
 class TsvGeneInfo:
     def __init__(self, gene_id: str, gene_symbol: str, gene_desc: str, tax_name: str, gene_type: str, gene_group_id: str = None, gene_group_method: str = None):
@@ -53,8 +71,37 @@ class TsvGeneInfo:
         self.gene_group_method = gene_group_method
 
 
-def parse_tsv_gene_list(file_path) -> List[TsvGeneInfo]:
-    gene_list = []
+# Database Table
+class GeneEntry(Base):
+    __tablename__ = "gene_table"
+
+    gene_id = sa.Column(sa.Integer, primary_key=True)
+    gene_symbol = sa.Column(sa.String)
+    gene_response = sa.Column(sa.String)
+
+    def __init__(self, gene_id, gene_symbol, gene_response):
+        self.gene_id = gene_id
+        self.gene_symbol = gene_symbol
+        self.gene_response = gene_response
+        self.ontology: dict[str, List[Ontology]] = None
+
+
+class GeneDictionary:
+    def __init__(self, species: str):
+        self.species = species
+        self.genes: dict[str, GeneEntry] = {}
+
+class Node:
+    def __init__(self, gene):
+        self.gene = gene
+        self.children: List[GeneEntry] = []
+
+    def add_child(self, node):
+        self.children.append(node)
+
+
+def parse_tsv_gene_list(file_path: str) -> List[TsvGeneInfo]:
+    gene_list: List[TsvGeneInfo] = []
     with open(file_path, 'r') as file:
         reader = csv.reader(file, delimiter='\t')
         for row in reader:
@@ -65,19 +112,18 @@ def parse_tsv_gene_list(file_path) -> List[TsvGeneInfo]:
     return gene_list
 
 
-def compress_string(string):
+def compress_string(string: str):
     bytes = string.encode('utf-8')
     compressed = zlib.compress(bytes, level=zlib.Z_BEST_COMPRESSION)
     return compressed
 
 
-def decompress_to_string(bytes):
+def decompress_to_string(bytes: bytes):
     data = zlib.decompress(bytes)
     return data.decode('utf-8')
 
 
-def fetch_ncbi_gene(gene_ids):
-    print(f"Downloading genes")
+def fetch_ncbi_gene(gene_ids: List[str]):
     try:
         # NCBI allows at most 10 requets per second with API key, 3 per second otherwises.
         if Entrez.api_key == None:
@@ -86,6 +132,7 @@ def fetch_ncbi_gene(gene_ids):
             sleep(.1)
 
         handle = Entrez.efetch(db="gene", id=",".join(gene_ids), rettype="xml")
+        # return type is xml, Entrez turns it into a dictionary. 
         gene_records = Entrez.read(handle)
         handle.close()
         return gene_records
@@ -95,226 +142,196 @@ def fetch_ncbi_gene(gene_ids):
         return None
     
 
-def process_genes(gene_list_file, redownload, database) -> List[EntrezGeneElement]:
+def extract_gene_symbol_from_response(gene_response: dict) -> str:
+    try:
+        # Preferred, but not all have this set
+        entrezgene_properties = gene_response.get('Entrezgene_properties', [{}])[0]
+        gene_commentary_properties = entrezgene_properties.get('Gene-commentary_properties', [{}])[0]
+        symbol = gene_commentary_properties.get('Gene-commentary_text')
+    except IndexError:
+        symbol = None
+    
+    if symbol == None:
+        entrezgene_gene = gene_response.get('Entrezgene_gene', {})
+        gene_ref = entrezgene_gene.get('Gene-ref', {})
+        symbol = gene_ref.get('Gene-ref_locus', {})
+        assert symbol != None, "No symbol in the NCBI response?"
+    return symbol
+
+
+def extract_gene_id_from_response(gene_response: dict) -> str:
+    entrezgene_track = gene_response.get('Entrezgene_track-info', {})
+    gene_track = entrezgene_track.get('Gene-track', {})
+    id = gene_track.get('Gene-track_geneid')
+    assert id != None, "No gene ID in the NCBI response?"
+    return id
+
+
+# Downloads NCBI data for each gene in the gene list file and saves data into the database
+# If the gene already exists in the table, it does not query NCBI unless `redownload` is set to `True`
+def download_genes(gene_list_file: str, redownload: bool, database: GeneDatabase):
     gene_list = parse_tsv_gene_list(gene_list_file)
-    assert(len(gene_list) > 0)
+    assert len(gene_list) > 0
 
-    species = gene_list[0].tax_name
-    if os.path.exists(f"{species}_gene_cache.pkl") and not redownload:
-        return depicklefy(f"{species}_gene_cache.pkl")
-    
-    processed_genes = []
-    
-    # Batch up requests to NCBI, though unnessary if it's already saved in the database
+    # Batch up requests to NCBI
     chunk_size = 100
-    for i in range(0, len(gene_list), chunk_size):
-        # Uncomment and change the number to start where you left off at if you're downloading *EVERYTHING*
-        # I could probably make a new .tsv file leaving only what is left to be queried since there's no real ordering in the database, and use that 
-        # to pick up where it left off at, or make a temporary file listing just the gene IDs remaining. 
-        # That's a more elegant than me manually changing the index. But changing the number is less effort and time is not of the essence, so, change the number 
-        # idx = i + 130480
-        idx = i
-
-        chunk = gene_list[idx : idx + chunk_size]
+    print("Downloading genes ...")
+    for i in tqdm(range(0, len(gene_list), chunk_size)):
+        chunk = gene_list[i : i + chunk_size]
         gene_ids = [gene.gene_id for gene in chunk]
         unprocessed_genes = []
         for id in gene_ids:
-            db_gene = get_gene_in_database(gene_id=id, database=database)
-            if not db_gene or redownload:
+            exists = does_gene_exist_in_database(id, database)
+            if not exists or redownload:
                 unprocessed_genes.append(id)
+
+        if len(unprocessed_genes) == 0:
+            continue
+
+        ncbi_gene_responses = fetch_ncbi_gene(gene_ids=unprocessed_genes)
+        if ncbi_gene_responses == None:
+            continue
+
+        for response in ncbi_gene_responses:
+            gene_id = extract_gene_id_from_response(response)
+            gene_symbol = extract_gene_symbol_from_response(response)
+            if does_gene_exist_in_database(gene_id, database):
+                update_gene_in_database(gene_id, response, database)
             else:
-                decompressed_response = decompress_to_string(db_gene.gene_response)
-                obj = json.loads(decompressed_response)
-                processed_genes.append(obj)
+                save_gene_to_database(gene_id, gene_symbol, response, database)
 
-        if len(unprocessed_genes) != 0:
-            ncbi_gene_responses = fetch_ncbi_gene(gene_ids=unprocessed_genes)
-            if ncbi_gene_responses == None:
-                continue
+# Adds genes from the gene_list_file using data stored in the database, 
+# and places them in a GeneDictionary object: key = gene id, value = GeneEntry
+# All Homo sapien genes results in about 55GB of RAM.
+def generate_gene_dictionary(gene_list_file: str, database: GeneDatabase) -> GeneDictionary:
+    gene_list = parse_tsv_gene_list(gene_list_file)
+    assert(len(gene_list) > 0)
 
-            for response in ncbi_gene_responses:
-                gene = EntrezGeneElement.from_dict(response)
-                # Compress the response when saving in the database, otherwise you're looking at 15GB+ of text.
-                compressed_gene = compress_string(json.dumps(response))
-                save_gene_to_database(gene=gene, ncbi_raw_response=compressed_gene, database=database)
-                processed_genes.append(response)
+    gene_dict = GeneDictionary(species=gene_list[0].tax_name)
 
-        print(f"Processed {idx + chunk_size} genes out of {len(gene_list)}")
+    print("Building gene dictionary ...")
+    for gene in tqdm(gene_list[:1]):
+        db_gene = get_gene_entry_in_database('gene_id', gene.gene_id, database)
+        if db_gene:
+            gene_dict.genes[gene.gene_id] = db_gene
 
-    # Three FIXME's here that would be nice to address if I were to expand on this:
-    #   1. The memory usage is pretty ridiclious. On my system, I'm using over 80GB of RAM. 
-    #   2. Converting the dictionary into it's objects takes quite a long time.
-    #   3. It'd be faster to parse the raw dictionaries instead of shoving the data into objects. 
-    #      I did not simply due to the large number of nested entries and lists within the response.
-    #      Example: 
-    #           genes[x]['Entrezgene_properties'][2]['Gene-commentary_comment'][1]['Gene-commentary_comment'][0]['Gene-commentary_source'][0]['Other-source_anchor']
-    #      Or maybe keep the json response compressed until I need to start generating the graph.
-
-    print("Converting..")
-    genes = None
-    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
-        futures = [executor.submit(EntrezGeneElement.from_dict, gene) for gene in processed_genes]
-        genes = [future.result() for future in concurrent.futures.as_completed(futures) if future.result()]
-
-    # Cache results
-    picklefy(genes, f"{species}_gene_cache.pkl")
-    return genes
-
-def picklefy(data, file_name):
-    with open(file_name, "wb") as file:
-        print(f"picklefying {file_name}")
-        pickle.dump(data, file)
+    return gene_dict
 
 
-def depicklefy(file_name):
-    with open(file_name, "rb") as file:
-        print(f"depicklefying {file_name}")
-        return pickle.load(file)
-
-def open_database():
-    engine = sa.create_engine('sqlite:///gene.db', echo=False)
-    metadata = sa.MetaData()
-
-    gene_table = None
-
-    ins = sa.inspect(engine)
-    if not ins.dialect.has_table(engine.connect(), 'gene_table'):
-        gene_table = sa.Table('gene_table', metadata,
-            sa.Column('gene_id', sa.Integer, primary_key=True),
-            sa.Column('gene_symbol', sa.String),
-            sa.Column('gene_name', sa.String),          # NCBI response -> Entrezgene_properties -> Gene-commentary_properties -> "Official Full name" -> Gene-commentary_text 
-            sa.Column('gene_summary', sa.String),       # NCBI response, if any
-            sa.Column('gene_response', sa.String))      # Stores the complete NCBI response 
-        gene_table.create(engine)
-    else:
-        gene_table = sa.Table("gene_table", metadata, autoload_with=engine)
-
-    return {'engine': engine, \
-            'gene_table': gene_table}
+def does_gene_exist_in_database(gene_id: str, database: GeneDatabase) -> bool:
+    query = database.session.query(GeneEntry).filter(GeneEntry.gene_id == gene_id)
+    (exists,) = database.session.query(query.exists()).one()
+    return exists
 
 
-def get_gene_name_and_symbol(gene: EntrezGeneElement):
-    gene_name = None
-    gene_symbol = None
-
-    if gene.entrezgene_properties:
-        for property in gene.entrezgene_properties:
-            if property.gene_commentary_label == "Nomenclature":
-                for sub_property in property.gene_commentary_properties:
-                    if sub_property.gene_commentary_label == "Official Symbol":
-                        gene_symbol = sub_property.gene_commentary_text
-                    if sub_property.gene_commentary_label == "Official Full Name":
-                        gene_name = sub_property.gene_commentary_text
-
-    # Some genes don't have the "Nomenclature" field, so grab this information in another location
-    if gene_symbol == None:
-        gene_symbol = gene.entrezgene_gene.gene_ref.gene_ref_locus
-    if gene_name == None:
-        gene_name = gene.entrezgene_gene.gene_ref.gene_ref_desc
-    if gene_name == None:
-        gene_name = gene_symbol
-
-    return {'name': gene_name, 'symbol': gene_symbol}
-
-
-def get_gene_in_database(gene_id, database):
-    engine = database['engine']
-    gene_table = database['gene_table']
-    with engine.connect() as conn:
-        query = sa.select(gene_table).where(gene_table.c.gene_id == gene_id)
-        result = conn.execute(query)
-        return result.fetchone()
-
-
-def save_gene_to_database(gene, ncbi_raw_response, database):
-    engine = database['engine']
-    gene_table = database['gene_table']
-
-    gene_id = gene.entrezgene_track_info.gene_track.gene_track_geneid
-    result = get_gene_name_and_symbol(gene)
-    gene_name = result['name']
-    gene_symbol = result['symbol']
-    gene_summary = gene.entrezgene_summary
-
-    with engine.connect() as conn:
-        query = sa.select(gene_table).where(gene_table.c.gene_id == gene_id)
-        result = conn.execute(query)
-        row = result.fetchone()
-        entry = None
-        if row:
-            entry = sa.update(gene_table).where(gene_table.c.gene_id == gene_id).values(gene_symbol=gene_symbol, \
-                                                        gene_name=gene_name, gene_summary=gene_summary, gene_response=ncbi_raw_response)
-        else:
-            entry = sa.insert(gene_table).values(gene_id=gene_id, gene_symbol=gene_symbol, \
-                                                        gene_name=gene_name, gene_summary=gene_summary, gene_response=ncbi_raw_response)
-        conn.execute(entry)
-        conn.commit()
-
-
-def get_geneontology_data_pair(gene, node_type):
+def get_gene_entry_in_database(column: str, value: object, database: GeneDatabase) -> GeneEntry:
     try:
-        commentaries =  [c for c in gene.entrezgene_properties              if c.gene_commentary_heading == 'GeneOntology']
-        comments =      [c for c in commentaries[0].gene_commentary_comment if c.gene_commentary_label == node_type]
-        new_comments =  [c for comment in comments for c in comment.gene_commentary_comment if c.gene_commentary_source]
-        node = new_comments[0].gene_commentary_source[0].other_source_anchor
-        desc = new_comments[0].gene_commentary_source[0].other_source_pre_text.replace('_', ' ')
-        return {"node": node, "description": desc}
-    except:
+        entry = database.session.query(GeneEntry).filter(getattr(GeneEntry, column) == value).one()
+        entry_copy = deepcopy(entry)
+        entry_copy.gene_response = json.loads(decompress_to_string(entry_copy.gene_response))
+        return entry_copy
+    except sa.exc.NoResultFound:
+        print(f"No entry found for {column} - {value}")
         return None
+    except Exception as e:
+        print(f"Problem querying for {column} - {value}.")
+        print(e)
+        return None
+
+
+def save_gene_to_database(gene_id: str, gene_symbol: str, gene_response: dict, database: GeneDatabase):
+    # Compress the response when saving in the database, otherwise you're looking at 15GB+ of text for Homo sapiens genes.
+    compressed_gene_response = compress_string(json.dumps(gene_response))
+    entry = GeneEntry(gene_id, gene_symbol, compressed_gene_response)
+    database.session.add(entry)
+    database.session.commit()
+
+
+def update_gene_in_database(gene_id: str, gene_response: dict, database: GeneDatabase):
+    gene = get_gene_entry_in_database('gene_id', gene_id, database)
+    compressed_gene_response = compress_string(json.dumps(gene_response))
+    gene.gene_response = compressed_gene_response
+    database.session.commit()
+
+
+class OntologyData:
+    def __init__(self, pre_text, anchor, post_text):
+        self.pre_text = pre_text
+        self.anchor = anchor
+        self.post_text = post_text
+
+class Ontology:
+    def __init__(self, components=List[OntologyData], functions=List[OntologyData], processes=List[OntologyData]):
+        self.components = components
+        self.functions = functions
+        self.processes = processes
+
+def get_ontology_data(comment: dict, match: str) -> List[OntologyData]:
+
+    get_fields = lambda comment, match: \
+       comment['Gene-commentary_source'][0].get(match)
     
+    data: List[OntologyData] = []
 
-def add_geneontology_to_graph(graph, gene_name_node, property, node_color, prepend=None):
-    nodes_added = []
-    for comment in property.gene_commentary_comment:
-        if len(comment.gene_commentary_source) > 1:
-            print("more than 1 gene_commentary_source?")
-            breakpoint()
+    for ontology_comment in comment.get('Gene-commentary_comment', []):
+        pre_text = get_fields(ontology_comment, 'Other-source_pre-text')
+        anchor = get_fields(ontology_comment, 'Other-source_anchor')
+        post_text = get_fields(ontology_comment, 'Other-source_post-text') 
+        data.append(OntologyData(pre_text, anchor, post_text))
 
-        node_name = comment.gene_commentary_source[0].other_source_anchor
-        desc = comment.gene_commentary_source[0].other_source_pre_text.replace('_', ' ')
-
-        if prepend:
-            node_name = f"{prepend}_{node_name}"
-        add_edge_to_node(graph, node_name, gene_name_node, desc, node_color)
-        nodes_added.append(node_name)
-
-    return nodes_added
-    
-
-def add_edge_to_node(graph, node, node_name, node_desc, node_color):
-    if not graph.has_node(node):
-        graph.add_node(node, color=node_color)
-    graph.add_edge(node_name, node, label=node_desc)
+    return data
 
 
-def generate_graph_data(genes=List[EntrezGeneElement], separate_graphs=False, root_node_type="Component"):
+def get_ontology(properties: dict):
+    for prop in properties:
+        if prop.get('Gene-commentary_heading') == "GeneOntology":
+            prop_comments = prop.get('Gene-commentary_comment', [])
+            for comment in prop_comments:
+                label = comment['Gene-commentary_label']
+                if label == 'Component':
+                    components = get_ontology_data(comment, 'Component')
+                elif label == 'Function':
+                   functions = get_ontology_data(comment, 'Function')
+                elif label == 'Process':
+                    processes = get_ontology_data(comment, 'Process')
+    return Ontology(components, functions, processes)
+
+
+def add_edge_to_node(graph: nx.Graph, new_node: str, node_desc: str, node_color: str, from_node: str) -> bool:
+    if not graph.has_node(new_node):
+        graph.add_node(new_node, color=node_color)
+    if graph.has_edge(from_node, new_node):
+        return False
+    graph.add_edge(from_node, new_node, label=node_desc)
+    return True
+
+
+def generate_cell_component_graph_data(genes:List[GeneEntry], separate_graphs=False):
     assert(genes != None and len(genes) >= 1)
-    print("Making graph")
-    # Build a dictionary where each key is a unique cellular component, and values are genes that 
-    # have this cellular component listed in the GeneOntology section of the NCBI data 
-    unordered_trees = {}
-    for gene in genes:
-        if gene.entrezgene_properties == None or len(gene.entrezgene_properties) == 1:
-            continue
+    print("Construction cell component graph")
 
-        gene_name = gene.entrezgene_gene.gene_ref.gene_ref_locus
-        if gene_name == None:
-            continue
+    component_tree = {}
+    # Build trees where roots are cellular components and sub nodes are genes that exist in those components
+    component_tree = defaultdict(list)
 
-        # Input data for GeneOntology section lists out: "Component", "Function", "Process"
-        data_pair = get_geneontology_data_pair(gene, node_type=root_node_type)
-        if data_pair == None:
-            continue
+    print("Preprocess...")
+    for gene in tqdm(genes):
+        properties = gene.gene_response.get('Entrezgene_properties', [])
+        # FIXME: move all additional data gathering from the original response after querying from the table
+        # Probably save in database for quicker access
+        gene.ontology = get_ontology(properties)
+        for component in gene.ontology.components:
+            # anchor is the cellular component, check if there's already a root in the tree
+            if component.anchor in component_tree:
+                # Add gene to the cell component root
+                # A single gene can have duplicate "cell component" fields, but these just have a different value for post-text evidence.
+                if gene not in component_tree[component.anchor]:
+                    component_tree[component.anchor].append(gene)
+            else:
+                component_tree[component.anchor].append(gene)
 
-        node = data_pair['node']
-        if node in unordered_trees:
-            unordered_trees[node].append(gene)
-        else:
-            unordered_trees[node] = [gene]
-        
-    # Not required for the graph but the seeing the number of genes in a specific component is interesting
-    component_tree = dict(sorted(unordered_trees.items(), key=lambda item: len(item[1]), reverse=True))
-
+    ordered_component_tree = dict(sorted(component_tree.items(), key=lambda item: len(item[1]), reverse=True))
+    
     results_dir = "component_graph_results"
     if not os.path.exists(results_dir):
         os.mkdir(results_dir)
@@ -327,46 +344,114 @@ def generate_graph_data(genes=List[EntrezGeneElement], separate_graphs=False, ro
     node_color_gene = "blue"
     node_color_function = "purple"
     node_color_process = "orange"
-
-    # I could probably generate various statistics here from the rest of the NCBI data, though I'm not sure what exactly right now.
-
-    number_of_genes_file = open("component_graph_results/number_of_genes_per_component.txt", mode='w')
-    number_of_genes_file.write("Cellular component - # of genes\n")
-    for node in component_tree.items():
+    
+    number_of_genes_file = open(f"{results_dir}/number_of_genes_per_component.txt", mode='w')
+    number_of_genes_file.write("Cellular component | # of genes\n")
+    print("Constructing..")
+    for node in tqdm(ordered_component_tree.items()):
         if separate_graphs:
             graph = nx.Graph()
 
-        root_node = node[0]
-        graph.add_node(root_node, color=node_color_component)
+        # The component
+        component_root_node = node[0]
+        graph.add_node(component_root_node, color=node_color_component)
 
-        children = node[1]
-        number_of_genes_file.write(f"{root_node} - {len(children)}\n")
-        for child in children:
-            gene_name_node = child.entrezgene_gene.gene_ref.gene_ref_locus
+        # The list of genes at this component
+        genes: List[GeneEntry] = node[1]
 
-            graph.add_node(f"{gene_name_node}", color=node_color_gene)
-            graph.add_edge(root_node, f"{gene_name_node}")
+        number_of_genes_file.write(f"{component_root_node} | {len(genes)}\n")
 
-            for commentary in child.entrezgene_properties:
-                if commentary.gene_commentary_heading == 'GeneOntology':
-                    for comment in commentary.gene_commentary_comment:
-                        if comment.gene_commentary_label == 'Function':
-                             add_geneontology_to_graph(graph=graph, gene_name_node=f"{gene_name_node}", property=comment, node_color=node_color_function, prepend=root_node)
-                        elif comment.gene_commentary_label == 'Process':
-                            add_geneontology_to_graph(graph=graph, gene_name_node=f"{gene_name_node}", property=comment, node_color=node_color_process, prepend=root_node)
+        # child = gene
+        for gene in genes:
+            # Genes can have different cellular components. To avoid genes forming edges to different component, prepend the component to the gene symbol string 
+            if separate_graphs:
+                gene_name_node = gene.gene_symbol
+            else:
+                gene_name_node = f"{component_root_node}_{gene.gene_symbol}"
+            
+            add_edge_to_node(graph=graph, new_node=gene_name_node, node_desc="", node_color=node_color_gene, from_node=component_root_node)
+            
+            for function in gene.ontology.functions:
+                if separate_graphs:
+                    func_node_name = function.anchor
+                else:
+                    func_node_name = f"{component_root_node}_{function.anchor}"
+                add_edge_to_node(graph=graph, new_node=func_node_name, node_desc=function.pre_text, node_color=node_color_function, from_node=gene_name_node)
+
+            for process in gene.ontology.processes:
+                if separate_graphs:
+                    process_node_name = process.anchor
+                else:
+                    process_node_name = f"{component_root_node}_{process.anchor}"
+                add_edge_to_node(graph=graph, new_node=process_node_name, node_desc=process.pre_text, node_color=node_color_process, from_node=gene_name_node)
 
         if separate_graphs:
-            root_node = root_node.replace('/','_')
-            root_node = root_node.replace(':','_')
-            filename = f"{root_node}_component_graph.gml"
+            component_root_node = component_root_node.replace('/','_').replace(':','_')
+            filename = f"{component_root_node}_testcomponent_graph.gml"
             nx.write_gml(graph, f"{results_dir}/{filename}")
 
     number_of_genes_file.close()
 
     if not separate_graphs:
-        nx.write_gml(graph, f"{results_dir}/component_graph.gml")
+        nx.write_gml(graph, f"{results_dir}/testcomponent_graph.gml")
 
-    return component_tree
+
+def get_interacting_genes(gene: GeneEntry) -> List[str]:
+    interacting_gene_ids = []
+    comments = gene.gene_response.get('Entrezgene_comments', [])
+    for comment in comments:
+        if comment.get('Gene-commentary_heading', {}) == 'Interactions':
+            for interaction_comment in comment.get('Gene-commentary_comment', []):
+                for sub_comment in interaction_comment.get('Gene-commentary_comment', []):
+                    for source in sub_comment.get('Gene-commentary_source', []):
+                        if source.get('Other-source_src', {}).get('Dbtag', {}).get('Dbtag_db', {}) == 'GeneID':
+                            gene_id = source.get('Other-source_src', {}).get('Dbtag', {}).get('Dbtag_tag', {}).get('Object-id', {}).get('Object-id_id', {})
+                            interacting_gene_ids.append(gene_id)
+
+    return interacting_gene_ids
+
+
+# TODO: Double check this implementation 
+def generate_gene_interaction_graph(gene_dictionary: GeneDictionary, database: GeneDatabase):
+    graph = nx.Graph()
+    original = deepcopy(gene_dictionary)
+    for item in original.genes.items():
+            
+        gene_entry = item[1]
+        root = Node(gene=gene_entry)
+        queue = deque([root])
+        
+        root_sym = gene_entry.gene_symbol
+        curr_sym = root_sym
+
+        while queue:
+            current_node = queue.popleft()
+            interacting_gene_ids = get_interacting_genes(current_node.gene)
+            curr_sym = extract_gene_symbol_from_response(current_node.gene.gene_response)
+
+            if not graph.has_node(curr_sym):
+                graph.add_node(curr_sym, color='green')
+            # This takes so long if you try to link up all interactions..
+            for gene_id in interacting_gene_ids[:3]:
+                interacting_gene = None
+                if not gene_dictionary.genes.get(gene_id):
+                    interacting_gene = get_gene_entry_in_database(column='gene_id', value=gene_id, database=database)
+                    if interacting_gene == None:
+                        print(f'gene id {gene_id} not in database..skipping')
+                        continue
+                    # Cache to avoid requerying if another gene interacts with this one when the gene_dictionary does not contain all genes
+                    gene_dictionary.genes[interacting_gene.gene_id] = interacting_gene
+                else:
+                    interacting_gene = gene_dictionary.genes.get(gene_id)
+                print(f"{interacting_gene.gene_symbol} interacts with {curr_sym}")
+                added_node = add_edge_to_node(graph=graph, new_node=interacting_gene.gene_symbol, node_desc="", node_color='white', from_node=curr_sym)
+                if not added_node:
+                    continue
+                child_node = Node(interacting_gene)
+                current_node.add_child(child_node)
+                queue.append(child_node)
+
+    nx.write_gml(graph, "interactions_graph.gml")
 
 
 def main():
@@ -395,7 +480,9 @@ def main():
     """)
     parser.add_argument("--tsv_gene_list_file", type=str, required=True, help="Supply the list of genes as downloaded from NCBI you wish to build a graph of - in NCBI TSV format")
     parser.add_argument("--redownload", action='store_true', help="Set to redownload the response from NCBI and resave in the database")
+    parser.add_argument("--skip_download", action='store_true', help="Set to bypass downloading from NCBI and attempt to query directly from the database.")
     parser.add_argument("--separate_graphs", action='store_true', help="Set to create individual gml files for each cellular component instead of having all cellular component graphs in one gml")
+    parser.add_argument("--option", type=str, required=True, help="Specify what the script will do. Supported options: `interaction` or `component_graph")
     args = parser.parse_args()
 
     ncbi_api_key = os.getenv("NCBI_API_KEY")
@@ -416,12 +503,20 @@ def main():
     if not os.path.exists(args.tsv_gene_list_file):
         print(f"{args.tsv_gene_list_file} not found")
         exit()
-        
+    
     gene_database = open_database()
+    if not args.skip_download:
+        download_genes(gene_list_file=args.tsv_gene_list_file, redownload=args.redownload, database=gene_database)
 
-    genes = process_genes(gene_list_file=args.tsv_gene_list_file, redownload=args.redownload, database=gene_database)
-    generate_graph_data(genes=genes, separate_graphs=args.separate_graphs)
+    gene_dictionary = generate_gene_dictionary(args.tsv_gene_list_file, gene_database)
 
+    if args.option == 'interactions':
+        # I don't like the implementation of this. The interactions can also list proteins instead of a specific gene.
+        # Plus I don't think you can actually infer anything from this as is other than "gee that's a lot"
+        generate_gene_interaction_graph(gene_dictionary, gene_database)
+    
+    if args.option == 'component_graph':
+        generate_cell_component_graph_data(gene_dictionary.genes.values(), separate_graphs=args.separate_graphs)
 
 if __name__ == '__main__':
     main()

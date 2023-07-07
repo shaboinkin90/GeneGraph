@@ -12,8 +12,10 @@
             "console": "integratedTerminal",
             "justMyCode": true,
             "args":[
-                "--tsv_gene_list_file", "gene_list/homo_sapiens_gene_list.tsv",
-                "--redownload",
+                "--tsv_gene_list_file", "gene_list/snippet.tsv",
+                "--skip_download",
+                "--separate_graphs",
+                "--option", "interactions"
             ]
         }
     ]

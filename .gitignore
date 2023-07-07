@@ -134,3 +134,7 @@ dmypy.json
 
 *.db
 *.pkl
+*.gml
+*.txt
+*.tsv
+*.graphia
